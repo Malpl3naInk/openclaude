@@ -71,6 +71,7 @@ function sleepMs(ms: number): Promise<void> {
 interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
   content?: string | Array<{ type: string; text?: string; image_url?: { url: string } }>
+  reasoning_content?: string
   tool_calls?: Array<{
     id: string
     type: 'function'
@@ -211,9 +212,19 @@ function convertMessages(
       // Check for tool_use blocks
       if (Array.isArray(content)) {
         const toolUses = content.filter((b: { type?: string }) => b.type === 'tool_use')
+        const thinkingContent = content.filter((b: { type?: string }) => b.type === 'thinking')
         const textContent = content.filter(
           (b: { type?: string }) => b.type !== 'tool_use' && b.type !== 'thinking',
         )
+
+        // Extract reasoning_content from thinking blocks for API compatibility
+        let reasoningContent: string | undefined
+        if (thinkingContent.length > 0) {
+          reasoningContent = thinkingContent
+            .map((b: { thinking?: string }) => b.thinking ?? '')
+            .filter(Boolean)
+            .join('\n\n')
+        }
 
         const assistantMsg: OpenAIMessage = {
           role: 'assistant',
@@ -221,6 +232,11 @@ function convertMessages(
             const c = convertContentBlocks(textContent)
             return typeof c === 'string' ? c : Array.isArray(c) ? c.map((p: { text?: string }) => p.text ?? '').join('') : ''
           })(),
+        }
+
+        // Add reasoning_content if present (required by API when thinking is enabled)
+        if (reasoningContent) {
+          assistantMsg.reasoning_content = reasoningContent
         }
 
         if (toolUses.length > 0) {
@@ -368,6 +384,7 @@ interface OpenAIStreamChunk {
     delta: {
       role?: string
       content?: string | null
+      reasoning_content?: string | null
       tool_calls?: Array<{
         index: number
         id?: string
@@ -417,6 +434,8 @@ async function* openaiStreamToAnthropic(
   let contentBlockIndex = 0
   const activeToolCalls = new Map<number, { id: string; name: string; index: number; jsonBuffer: string }>()
   let hasEmittedContentStart = false
+  let hasEmittedThinkingStart = false
+  let thinkingBlockIndex = -1
   let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
   let hasEmittedFinalUsage = false
   let hasProcessedFinishReason = false
@@ -472,6 +491,26 @@ async function* openaiStreamToAnthropic(
 
       for (const choice of chunk.choices ?? []) {
         const delta = choice.delta
+
+        // Reasoning content from API - convert to thinking block
+        // reasoning_content typically arrives before content in streaming mode
+        if (delta.reasoning_content != null) {
+          if (!hasEmittedThinkingStart) {
+            thinkingBlockIndex = contentBlockIndex
+            yield {
+              type: 'content_block_start',
+              index: thinkingBlockIndex,
+              content_block: { type: 'thinking', thinking: '' },
+            }
+            hasEmittedThinkingStart = true
+            contentBlockIndex++
+          }
+          yield {
+            type: 'content_block_delta',
+            index: thinkingBlockIndex,
+            delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
+          }
+        }
 
         // Text content — use != null to distinguish absent field from empty string,
         // some providers send "" as first delta to signal streaming start
@@ -563,6 +602,12 @@ async function* openaiStreamToAnthropic(
           hasProcessedFinishReason = true
 
           // Close any open content blocks
+          if (hasEmittedThinkingStart) {
+            yield {
+              type: 'content_block_stop',
+              index: thinkingBlockIndex,
+            }
+          }
           if (hasEmittedContentStart) {
             yield {
               type: 'content_block_stop',
@@ -960,6 +1005,7 @@ class OpenAIShimMessages {
             | string
             | null
             | Array<{ type?: string; text?: string }>
+          reasoning_content?: string
           tool_calls?: Array<{
             id: string
             function: { name: string; arguments: string }
@@ -980,6 +1026,12 @@ class OpenAIShimMessages {
   ) {
     const choice = data.choices?.[0]
     const content: Array<Record<string, unknown>> = []
+
+    // Handle reasoning_content from API - convert to thinking block
+    const reasoningContent = choice?.message?.reasoning_content
+    if (reasoningContent && typeof reasoningContent === 'string') {
+      content.push({ type: 'thinking', thinking: reasoningContent })
+    }
 
     const rawContent = choice?.message?.content
     if (typeof rawContent === 'string' && rawContent) {
