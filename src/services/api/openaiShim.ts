@@ -214,7 +214,8 @@ function convertMessages(
         const toolUses = content.filter((b: { type?: string }) => b.type === 'tool_use')
         const thinkingContent = content.filter((b: { type?: string }) => b.type === 'thinking')
         const textContent = content.filter(
-          (b: { type?: string }) => b.type !== 'tool_use' && b.type !== 'thinking',
+          (b: { type?: string }) =>
+            b.type !== 'tool_use' && b.type !== 'thinking' && b.type !== 'redacted_thinking',
         )
 
         // Extract reasoning_content from thinking blocks for API compatibility

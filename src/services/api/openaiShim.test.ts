@@ -386,3 +386,292 @@ test('sanitizes malformed MCP tool schemas before sending them to OpenAI', async
   expect(properties?.priority?.enum).toEqual([0, 1, 2, 3])
   expect(properties?.priority).not.toHaveProperty('default')
 })
+
+test('non-streaming: converts reasoning_content to thinking block in response', async () => {
+  globalThis.fetch = (async (_input, _init) => {
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'deepseek-r1',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'The answer is 42.',
+              reasoning_content: 'Let me think about this...\n\nThe calculation is straightforward.',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 20,
+          total_tokens: 30,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  const result = await client.beta.messages.create({
+    model: 'deepseek-r1',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'What is the answer?' }],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const message = result as { content?: Array<Record<string, unknown>> }
+  expect(message.content).toHaveLength(2)
+  expect(message.content?.[0]).toMatchObject({
+    type: 'thinking',
+    thinking: 'Let me think about this...\n\nThe calculation is straightforward.',
+  })
+  expect(message.content?.[1]).toMatchObject({
+    type: 'text',
+    text: 'The answer is 42.',
+  })
+})
+
+test('streaming: converts delta.reasoning_content to thinking_delta events', async () => {
+  globalThis.fetch = (async (_input, _init) => {
+    const chunks = makeStreamChunks([
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'deepseek-r1',
+        choices: [
+          {
+            index: 0,
+            delta: { reasoning_content: 'Let me think' },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'deepseek-r1',
+        choices: [
+          {
+            index: 0,
+            delta: { reasoning_content: ' about this...' },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'deepseek-r1',
+        choices: [
+          {
+            index: 0,
+            delta: { content: 'The answer is 42.' },
+            finish_reason: null,
+          },
+        ],
+      },
+      {
+        id: 'chatcmpl-1',
+        object: 'chat.completion.chunk',
+        model: 'deepseek-r1',
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: 'stop',
+          },
+        ],
+      },
+    ])
+
+    return makeSseResponse(chunks)
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  const result = await client.beta.messages
+    .create({
+      model: 'deepseek-r1',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'What is the answer?' }],
+      max_tokens: 64,
+      stream: true,
+    })
+    .withResponse()
+
+  const events: Array<Record<string, unknown>> = []
+  for await (const event of result.data) {
+    events.push(event)
+  }
+
+  // Check thinking block start
+  const thinkingStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'thinking',
+  )
+  expect(thinkingStart).toBeDefined()
+
+  // Check thinking deltas
+  const thinkingDeltas = events.filter(
+    event =>
+      event.type === 'content_block_delta' &&
+      typeof event.delta === 'object' &&
+      event.delta !== null &&
+      (event.delta as Record<string, unknown>).type === 'thinking_delta',
+  )
+  expect(thinkingDeltas).toHaveLength(2)
+  expect((thinkingDeltas[0] as { delta?: { thinking?: string } }).delta?.thinking).toBe('Let me think')
+  expect((thinkingDeltas[1] as { delta?: { thinking?: string } }).delta?.thinking).toBe(' about this...')
+
+  // Check text content follows after thinking
+  const textStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'text',
+  )
+  expect(textStart).toBeDefined()
+
+  const textDelta = events.find(
+    event =>
+      event.type === 'content_block_delta' &&
+      typeof event.delta === 'object' &&
+      event.delta !== null &&
+      (event.delta as Record<string, unknown>).type === 'text_delta',
+  ) as { delta?: { text?: string } } | undefined
+  expect(textDelta?.delta?.text).toBe('The answer is 42.')
+})
+
+test('sending: converts thinking blocks to reasoning_content field in request body', async () => {
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'deepseek-r1',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'ok',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 1,
+          total_tokens: 11,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  await client.beta.messages.create({
+    model: 'deepseek-r1',
+    system: 'test system',
+    messages: [
+      { role: 'user', content: 'What is the answer?' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'Let me analyze this...' },
+          { type: 'text', text: 'The answer is 42.' },
+        ],
+      },
+    ],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>
+  const assistantMessage = messages.find(m => m.role === 'assistant')
+
+  expect(assistantMessage).toBeDefined()
+  expect(assistantMessage?.reasoning_content).toBe('Let me analyze this...')
+  expect(assistantMessage?.content).toBe('The answer is 42.')
+})
+
+test('filters out redacted_thinking blocks from text content', async () => {
+  let requestBody: Record<string, unknown> | undefined
+
+  globalThis.fetch = (async (_input, init) => {
+    requestBody = JSON.parse(String(init?.body))
+
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-1',
+        model: 'claude-3-7-sonnet',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              content: 'ok',
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 1,
+          total_tokens: 11,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  await client.beta.messages.create({
+    model: 'claude-3-7-sonnet',
+    system: 'test system',
+    messages: [
+      { role: 'user', content: 'What is the answer?' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'Visible thinking' },
+          { type: 'redacted_thinking', data: 'encrypted-content' },
+          { type: 'text', text: 'The answer is 42.' },
+        ],
+      },
+    ],
+    max_tokens: 64,
+    stream: false,
+  })
+
+  const messages = requestBody?.messages as Array<Record<string, unknown>>
+  const assistantMessage = messages.find(m => m.role === 'assistant')
+
+  // reasoning_content should only include thinking, not redacted_thinking
+  expect(assistantMessage?.reasoning_content).toBe('Visible thinking')
+  // content should only include text, not redacted_thinking
+  expect(assistantMessage?.content).toBe('The answer is 42.')
+})
