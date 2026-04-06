@@ -507,6 +507,7 @@ async function* openaiStreamToAnthropic(
   const activeToolCalls = new Map<number, { id: string; name: string; index: number; jsonBuffer: string }>()
   let hasEmittedContentStart = false
   let hasEmittedThinkingStart = false
+  let thinkingBlockClosed = false
   let thinkingBlockIndex = -1
   let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
   let hasEmittedFinalUsage = false
@@ -566,7 +567,9 @@ async function* openaiStreamToAnthropic(
 
         // Reasoning content from API - convert to thinking block
         // reasoning_content typically arrives before content in streaming mode
-        if (delta.reasoning_content != null) {
+        // Filter out empty/null values (DeepSeek sends "", Kimi sends actual content)
+        const reasoningContent = delta.reasoning_content
+        if (reasoningContent != null && reasoningContent !== '') {
           if (!hasEmittedThinkingStart) {
             thinkingBlockIndex = contentBlockIndex
             yield {
@@ -580,14 +583,21 @@ async function* openaiStreamToAnthropic(
           yield {
             type: 'content_block_delta',
             index: thinkingBlockIndex,
-            delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
+            delta: { type: 'thinking_delta', thinking: reasoningContent },
           }
         }
 
         // Text content — use != null to distinguish absent field from empty string,
-        // some providers send "" as first delta to signal streaming start
-        if (delta.content != null) {
+        // but filter out empty strings to avoid creating empty text blocks for role announcements.
+        // Some providers (Kimi) send "" as first delta to signal streaming start.
+        // DeepSeek sends null during reasoning phase.
+        const content = delta.content
+        if (content != null && content !== '') {
           if (!hasEmittedContentStart) {
+            if (hasEmittedThinkingStart && !thinkingBlockClosed) {
+              yield { type: 'content_block_stop', index: thinkingBlockIndex }
+              thinkingBlockClosed = true
+            }
             yield {
               type: 'content_block_start',
               index: contentBlockIndex,
@@ -598,7 +608,7 @@ async function* openaiStreamToAnthropic(
           yield {
             type: 'content_block_delta',
             index: contentBlockIndex,
-            delta: { type: 'text_delta', text: delta.content },
+            delta: { type: 'text_delta', text: content },
           }
         }
 
@@ -606,7 +616,11 @@ async function* openaiStreamToAnthropic(
         if (delta.tool_calls) {
           for (const tc of delta.tool_calls) {
             if (tc.id && tc.function?.name) {
-              // New tool call starting
+              // New tool call starting — close any open blocks first
+              if (hasEmittedThinkingStart && !thinkingBlockClosed) {
+                yield { type: 'content_block_stop', index: thinkingBlockIndex }
+                thinkingBlockClosed = true
+              }
               if (hasEmittedContentStart) {
                 yield {
                   type: 'content_block_stop',
@@ -674,11 +688,12 @@ async function* openaiStreamToAnthropic(
           hasProcessedFinishReason = true
 
           // Close any open content blocks
-          if (hasEmittedThinkingStart) {
+          if (hasEmittedThinkingStart && !thinkingBlockClosed) {
             yield {
               type: 'content_block_stop',
               index: thinkingBlockIndex,
             }
+            thinkingBlockClosed = true
           }
           if (hasEmittedContentStart) {
             yield {
